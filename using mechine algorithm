@@ -1,0 +1,479 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+from scipy.interpolate import PchipInterpolator
+from scipy.optimize import brentq
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.pipeline import Pipeline
+
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+
+import joblib
+
+APP_TITLE = "SoilSmart ML"
+MODEL_FILE_DEFAULT = "soil_model.pkl"
+DATA_FILE_DEFAULT = "soil_data.csv"
+
+USCS_CLASSES = ["SW","SP","SM","SC","ML","CL","MH","CH"]
+ML_ALGOS = {
+    "Random Forest": RandomForestClassifier,
+    "SVM (RBF)": SVC,
+    "Gradient Boosting": GradientBoostingClassifier,
+    "Logistic Regression": LogisticRegression,
+    "KNN": KNeighborsClassifier
+}
+
+# ---------------- Core geotechnical computations ----------------
+def find_d_value(pchip, target_percent):
+    return brentq(lambda x: pchip(x) - target_percent, pchip.x[0], pchip.x[-1])
+
+def compute_d_values(sizes, finer):
+    x = np.array(sizes, dtype=float)
+    y = np.array(finer, dtype=float)
+    sort_idx = np.argsort(x)
+    x_sorted, y_sorted = x[sort_idx], y[sort_idx]
+    # enforce monotonicity (PCHIP needs increasing x; y can be any shape but soils should be decreasing)
+    pchip = PchipInterpolator(x_sorted, y_sorted)
+    return {
+        "D10": float(find_d_value(pchip, 10)),
+        "D30": float(find_d_value(pchip, 30)),
+        "D60": float(find_d_value(pchip, 60)),
+    }
+
+def compute_coefficients(dvals):
+    D10, D30, D60 = dvals["D10"], dvals["D30"], dvals["D60"]
+    Cu = float(D60 / D10) if D10 else None
+    Cc = float((D30 ** 2) / (D60 * D10)) if (D10 and D60) else None
+    return {"Cu": Cu, "Cc": Cc}
+
+def classify_uscs_rule(ll, pl, fines_pct, cu=None, cc=None):
+    # Simplified USCS logic
+    pi = ll - pl
+    a_line_pi = 0.73 * (ll - 20)
+
+    if fines_pct < 5:
+        if cu and cc and cu >= 6 and 1 <= cc <= 3:
+            return "SW"
+        else:
+            return "SP"
+    elif 5 <= fines_pct < 50:
+        return "SM" if pi < a_line_pi else "SC"
+    else:
+        if pi < a_line_pi and ll < 50:
+            return "ML"
+        elif pi >= a_line_pi and ll < 50:
+            return "CL"
+        elif pi < a_line_pi and ll >= 50:
+            return "MH"
+        else:
+            return "CH"
+
+# ---------------- ML helpers ----------------
+def build_pipeline(algo_name, random_state=42):
+    if algo_name == "Random Forest":
+        model = RandomForestClassifier(n_estimators=200, random_state=random_state)
+        return Pipeline([("scaler", StandardScaler()), ("clf", model)])
+    elif algo_name == "SVM (RBF)":
+        model = SVC(probability=True, C=1.0, gamma="scale", random_state=random_state)
+        return Pipeline([("scaler", StandardScaler()), ("clf", model)])
+    elif algo_name == "Gradient Boosting":
+        model = GradientBoostingClassifier(random_state=random_state)
+        return Pipeline([("scaler", StandardScaler()), ("clf", model)])
+    elif algo_name == "Logistic Regression":
+        model = LogisticRegression(max_iter=200, random_state=random_state)
+        return Pipeline([("scaler", StandardScaler()), ("clf", model)])
+    elif algo_name == "KNN":
+        model = KNeighborsClassifier(n_neighbors=7)
+        return Pipeline([("scaler", StandardScaler()), ("clf", model)])
+    else:
+        raise ValueError(f"Unknown algorithm: {algo_name}")
+
+FEATURE_COLUMNS = ["D10","D30","D60","Cu","Cc","LL","PL","PI","FinesPct"]
+
+def validate_dataset(df):
+    missing_cols = [c for c in FEATURE_COLUMNS + ["USCS"] if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Dataset missing columns: {missing_cols}")
+    if df[FEATURE_COLUMNS].isnull().any().any() or df["USCS"].isnull().any():
+        raise ValueError("Dataset contains missing values; please clean your CSV.")
+
+# ---------------- GUI Application ----------------
+class SoilSmartApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("1280x840")
+        self.minsize(1000, 700)
+
+        self.model_pipeline = None
+        self.model_algo_name = tk.StringVar(value="Random Forest")
+        self.dataset_path = tk.StringVar(value=DATA_FILE_DEFAULT)
+        self.model_path = tk.StringVar(value=MODEL_FILE_DEFAULT)
+
+        self._build_ui()
+
+    def _build_ui(self):
+        nb = ttk.Notebook(self)
+        nb.pack(fill=tk.BOTH, expand=True)
+
+        self.tab_inputs = ttk.Frame(nb)
+        self.tab_results = ttk.Frame(nb)
+        self.tab_charts = ttk.Frame(nb)
+        self.tab_analytics = ttk.Frame(nb)
+
+        nb.add(self.tab_inputs, text="Inputs")
+        nb.add(self.tab_results, text="Results")
+        nb.add(self.tab_charts, text="Charts")
+        nb.add(self.tab_analytics, text="Analytics")
+
+        # Inputs tab
+        self._build_inputs_tab()
+
+        # Results tab
+        self._build_results_tab()
+
+        # Charts tab
+        self._build_charts_tab()
+
+        # Analytics tab
+        self._build_analytics_tab()
+
+        # Status bar
+        self.status = tk.StringVar(value="Ready")
+        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill=tk.X, padx=8, pady=4)
+
+    # ---------- Inputs tab ----------
+    def _build_inputs_tab(self):
+        frm = ttk.LabelFrame(self.tab_inputs, text="Input data")
+        frm.pack(fill=tk.X, padx=10, pady=10)
+
+        # Inputs
+        self.entry_sizes = ttk.Entry(frm, width=80)
+        self.entry_finer = ttk.Entry(frm, width=80)
+        self.entry_ll = ttk.Entry(frm, width=20)
+        self.entry_pl = ttk.Entry(frm, width=20)
+        self.entry_fines = ttk.Entry(frm, width=20)
+
+        ttk.Label(frm, text="Particle sizes (mm)").grid(row=0, column=0, sticky="w")
+        self.entry_sizes.insert(0, "4.75,2.36,1.18,0.6,0.3,0.15,0.075")
+        self.entry_sizes.grid(row=0, column=1, padx=6, pady=4, sticky="w")
+
+        ttk.Label(frm, text="Percent finer (%)").grid(row=1, column=0, sticky="w")
+        self.entry_finer.insert(0, "100,95,85,70,50,25,10")
+        self.entry_finer.grid(row=1, column=1, padx=6, pady=4, sticky="w")
+
+        ttk.Label(frm, text="Liquid limit (LL)").grid(row=2, column=0, sticky="w")
+        self.entry_ll.insert(0, "50")
+        self.entry_ll.grid(row=2, column=1, padx=6, pady=4, sticky="w")
+
+        ttk.Label(frm, text="Plastic limit (PL)").grid(row=3, column=0, sticky="w")
+        self.entry_pl.insert(0, "25")
+        self.entry_pl.grid(row=3, column=1, padx=6, pady=4, sticky="w")
+
+        ttk.Label(frm, text="Fines percentage (%)").grid(row=4, column=0, sticky="w")
+        self.entry_fines.insert(0, "30")
+        self.entry_fines.grid(row=4, column=1, padx=6, pady=4, sticky="w")
+
+        # Buttons row
+        btns = ttk.Frame(frm)
+        btns.grid(row=5, column=0, columnspan=2, sticky="w", pady=8)
+
+        ttk.Button(btns, text="Compute", command=self.on_compute).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Rule-based classify", command=self.on_rule_classify).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Add to dataset (CSV)", command=self.on_add_to_dataset).pack(side=tk.LEFT, padx=4)
+
+        # Dataset & model paths + algorithm
+        cfg = ttk.LabelFrame(self.tab_inputs, text="Training configuration")
+        cfg.pack(fill=tk.X, padx=10, pady=6)
+
+        ttk.Label(cfg, text="CSV dataset path").grid(row=0, column=0, sticky="w")
+        ttk.Entry(cfg, textvariable=self.dataset_path, width=60).grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Button(cfg, text="Browse...", command=self.browse_dataset).grid(row=0, column=2, padx=6)
+
+        ttk.Label(cfg, text="Model path (.pkl)").grid(row=1, column=0, sticky="w")
+        ttk.Entry(cfg, textvariable=self.model_path, width=60).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Button(cfg, text="Browse...", command=self.browse_model).grid(row=1, column=2, padx=6)
+
+        ttk.Label(cfg, text="Algorithm").grid(row=2, column=0, sticky="w")
+        algo_cb = ttk.Combobox(cfg, values=list(ML_ALGOS.keys()), textvariable=self.model_algo_name, state="readonly", width=30)
+        algo_cb.grid(row=2, column=1, sticky="w", padx=6)
+
+        ttk.Button(cfg, text="Train model", command=self.on_train).grid(row=3, column=0, padx=6, pady=6, sticky="w")
+        ttk.Button(cfg, text="Load model", command=self.on_load_model).grid(row=3, column=1, padx=6, pady=6, sticky="w")
+        ttk.Button(cfg, text="Predict current sample", command=self.on_predict_current).grid(row=3, column=2, padx=6, pady=6, sticky="w")
+        ttk.Button(cfg, text="Save outputs...", command=self.on_save_outputs).grid(row=3, column=3, padx=6, pady=6, sticky="w")
+
+    # ---------- Results tab ----------
+    def _build_results_tab(self):
+        out = ttk.LabelFrame(self.tab_results, text="Outputs")
+        out.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        self.txt = tk.Text(out, height=22)
+        self.txt.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+    # ---------- Charts tab ----------
+    def _build_charts_tab(self):
+        self.fig = Figure(figsize=(11,5), dpi=100)
+        self.ax_gsd = self.fig.add_subplot(121)  # Grain size distribution
+        self.ax_plasticity = self.fig.add_subplot(122)  # Plasticity chart
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.tab_charts)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    # ---------- Analytics tab ----------
+    def _build_analytics_tab(self):
+        self.fig2 = Figure(figsize=(11,5), dpi=100)
+        self.ax_cm = self.fig2.add_subplot(121)  # Confusion matrix
+        self.ax_metrics = self.fig2.add_subplot(122)  # per-class precision/recall/F1 bars
+
+        self.canvas2 = FigureCanvasTkAgg(self.fig2, master=self.tab_analytics)
+        self.canvas2.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    # ---------- Utilities ----------
+    def _read_inputs(self):
+        try:
+            sizes = [float(x.strip()) for x in self.entry_sizes.get().split(",") if x.strip()]
+            finer = [float(x.strip()) for x in self.entry_finer.get().split(",") if x.strip()]
+            if len(sizes) != len(finer):
+                raise ValueError("Sizes and percent finer must have the same length.")
+            ll = float(self.entry_ll.get())
+            pl = float(self.entry_pl.get())
+            fines = float(self.entry_fines.get())
+            return sizes, finer, ll, pl, fines
+        except Exception as e:
+            messagebox.showerror("Input error", f"Please fix inputs: {e}")
+            return None
+
+    def log(self, msg):
+        self.txt.insert(tk.END, msg + "\n")
+        self.txt.see(tk.END)
+
+    def browse_dataset(self):
+        path = filedialog.askopenfilename(title="Select CSV dataset", filetypes=[("CSV","*.csv"),("All files","*.*")])
+        if path:
+            self.dataset_path.set(path)
+
+    def browse_model(self):
+        path = filedialog.asksaveasfilename(title="Select/Save model file", defaultextension=".pkl", filetypes=[("Pickle","*.pkl"),("All files","*.*")])
+        if path:
+            self.model_path.set(path)
+
+    # ---------- Actions ----------
+    def on_compute(self):
+        vals = self._read_inputs()
+        if not vals: return
+        sizes, finer, ll, pl, fines = vals
+
+        dvals = compute_d_values(sizes, finer)
+        coeffs = compute_coefficients(dvals)
+        pi = ll - pl
+
+        self.log("[Compute]")
+        self.log(f" D-values: {dvals}")
+        self.log(f" Coefficients: {coeffs}")
+        self.log(f" LL={ll}, PL={pl}, PI={pi}, FinesPct={fines}\n")
+
+        # Plot GSD
+        self.ax_gsd.clear()
+        sort_idx = np.argsort(sizes)
+        xs = np.array(sizes)[sort_idx]
+        ys = np.array(finer)[sort_idx]
+        self.ax_gsd.semilogx(xs, ys, marker='o', linestyle='-', color='#1f77b4')
+        self.ax_gsd.set_title("Grain Size Distribution")
+        self.ax_gsd.set_xlabel("Particle size (mm)")
+        self.ax_gsd.set_ylabel("Percent finer (%)")
+        self.ax_gsd.grid(True, which="both", linestyle="--", alpha=0.5)
+
+        # Plot plasticity chart
+        self.ax_plasticity.clear()
+        LL_axis = list(range(20, 101, 10))
+        A_line = [0.73*(x-20) for x in LL_axis]
+        U_line = [0.9*x for x in LL_axis]
+        self.ax_plasticity.plot(LL_axis, A_line, 'r-', label="A-line")
+        self.ax_plasticity.plot(LL_axis, U_line, 'b--', label="U-line")
+        self.ax_plasticity.scatter([ll],[pi], color='green', s=70, label="Sample soil")
+        self.ax_plasticity.set_title("USCS Plasticity Chart")
+        self.ax_plasticity.set_xlabel("Liquid limit (LL)")
+        self.ax_plasticity.set_ylabel("Plasticity index (PI)")
+        self.ax_plasticity.legend()
+        self.ax_plasticity.grid(True, linestyle="--", alpha=0.5)
+
+        self.canvas.draw()
+
+    def on_rule_classify(self):
+        vals = self._read_inputs()
+        if not vals: return
+        sizes, finer, ll, pl, fines = vals
+        dvals = compute_d_values(sizes, finer)
+        coeffs = compute_coefficients(dvals)
+        cls = classify_uscs_rule(ll, pl, fines, coeffs["Cu"], coeffs["Cc"])
+        self.log(f"[Rule-based classify] USCS: {cls}\n")
+
+    def on_add_to_dataset(self):
+        vals = self._read_inputs()
+        if not vals: return
+        sizes, finer, ll, pl, fines = vals
+        dvals = compute_d_values(sizes, finer)
+        coeffs = compute_coefficients(dvals)
+        pi = ll - pl
+        rule_label = classify_uscs_rule(ll, pl, fines, coeffs["Cu"], coeffs["Cc"])
+
+        row = {
+            "D10": dvals["D10"], "D30": dvals["D30"], "D60": dvals["D60"],
+            "Cu": coeffs["Cu"], "Cc": coeffs["Cc"],
+            "LL": ll, "PL": pl, "PI": pi, "FinesPct": fines,
+            "USCS": rule_label
+        }
+
+        df_row = pd.DataFrame([row])
+        path = self.dataset_path.get()
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            df = pd.concat([df, df_row], ignore_index=True)
+        else:
+            df = df_row
+        df.to_csv(path, index=False)
+        self.log(f"[Dataset] Appended row to {path}\n")
+
+    def on_train(self):
+        path = self.dataset_path.get()
+        if not os.path.exists(path):
+            messagebox.showerror("Dataset error", f"CSV not found: {path}")
+            return
+        df = pd.read_csv(path)
+        try:
+            validate_dataset(df)
+        except Exception as e:
+            messagebox.showerror("Dataset error", str(e))
+            return
+
+        X = df[FEATURE_COLUMNS].values
+        y = df["USCS"].values
+
+        # split
+        X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.25, random_state=42)
+
+        algo_name = self.model_algo_name.get()
+        pipe = build_pipeline(algo_name)
+
+        pipe.fit(X_train, y_train)
+        y_pred = pipe.predict(X_test)
+
+        # classification report (dict)
+        report = classification_report(y_test, y_pred, labels=USCS_CLASSES, zero_division=0, output_dict=True)
+        report_text = classification_report(y_test, y_pred, labels=USCS_CLASSES, zero_division=0)
+        self.log(f"[Train] Algorithm: {algo_name}")
+        self.log(report_text + "\n")
+
+        # confusion matrix
+        cm = confusion_matrix(y_test, y_pred, labels=USCS_CLASSES)
+
+        # Plot analytics
+        self.ax_cm.clear()
+        self.ax_metrics.clear()
+
+        # Confusion matrix heatmap
+        im = self.ax_cm.imshow(cm, cmap="Blues")
+        self.ax_cm.set_title("Confusion matrix")
+        self.ax_cm.set_xticks(range(len(USCS_CLASSES)))
+        self.ax_cm.set_yticks(range(len(USCS_CLASSES)))
+        self.ax_cm.set_xticklabels(USCS_CLASSES, rotation=45, ha="right")
+        self.ax_cm.set_yticklabels(USCS_CLASSES)
+        self.fig2.colorbar(im, ax=self.ax_cm, fraction=0.046, pad=0.04)
+
+        # Per-class F1 (bar plot)
+        classes = []
+        f1s = []
+        for cls in USCS_CLASSES:
+            classes.append(cls)
+            f1s.append(report.get(cls, {}).get("f1-score", 0.0))
+        self.ax_metrics.bar(classes, f1s, color="#2ca02c")
+        self.ax_metrics.set_title("Per-class F1-score")
+        self.ax_metrics.set_ylim(0, 1)
+        self.ax_metrics.grid(True, axis="y", linestyle="--", alpha=0.5)
+
+        self.canvas2.draw()
+
+        # Save model
+        model_path = self.model_path.get()
+        joblib.dump(pipe, model_path)
+        self.model_pipeline = pipe
+        self.log(f"[Model] Saved to {model_path}\n")
+
+    def on_load_model(self):
+        path = self.model_path.get()
+        if not os.path.exists(path):
+            messagebox.showerror("Model error", f"Model file not found: {path}")
+            return
+        self.model_pipeline = joblib.load(path)
+        self.log(f"[Model] Loaded from {path}\n")
+
+    def on_predict_current(self):
+        if self.model_pipeline is None:
+            messagebox.showwarning("Predict", "Train or load a model first.")
+            return
+
+        vals = self._read_inputs()
+        if not vals: return
+        sizes, finer, ll, pl, fines = vals
+        dvals = compute_d_values(sizes, finer)
+        coeffs = compute_coefficients(dvals)
+        pi = ll - pl
+
+        feat = np.array([[dvals["D10"], dvals["D30"], dvals["D60"],
+                          coeffs["Cu"], coeffs["Cc"], ll, pl, pi, fines]])
+        y_pred = self.model_pipeline.predict(feat)[0]
+        if hasattr(self.model_pipeline.named_steps["clf"], "predict_proba"):
+            proba = self.model_pipeline.predict_proba(feat)[0]
+            top_idx = np.argsort(proba)[::-1][:3]
+            probs = [(self.model_pipeline.classes_[i], float(proba[i])) for i in top_idx]
+            self.log(f"[Predict] USCS={y_pred}, top-3={probs}\n")
+        else:
+            self.log(f"[Predict] USCS={y_pred}\n")
+
+    def on_save_outputs(self):
+        text = self.txt.get("1.0", tk.END)
+        path = filedialog.asksaveasfilename(title="Save outputs", defaultextension=".txt",
+                                            filetypes=[("Text","*.txt"),("All files","*.*")])
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        self.log(f"[Outputs] Saved to {path}\n")
+
+# ---------------- Starter dataset utility ----------------
+def ensure_starter_dataset(path):
+    if os.path.exists(path):
+        return
+    rows = [
+        # D10,D30,D60,Cu,Cc,LL,PL,PI,FinesPct,USCS
+        [0.15,0.17,0.29,1.93,0.68,50,25,25,30,"SC"],
+        [0.35,0.55,1.80,5.14,0.48,22,18,4,3,"SW"],
+        [0.02,0.03,0.06,3.00,0.75,35,20,15,65,"CL"],
+        [0.01,0.02,0.04,4.00,1.00,65,30,35,70,"CH"],
+        [0.20,0.40,0.80,4.00,1.00,45,25,20,40,"SM"],
+        [0.10,0.25,0.50,5.00,1.25,55,30,25,55,"MH"],
+        [0.30,0.60,1.20,4.00,1.00,28,20,8,10,"SP"],
+        [0.05,0.10,0.20,4.00,1.00,40,22,18,60,"CL"],
+    ]
+    df = pd.DataFrame(rows, columns=FEATURE_COLUMNS + ["USCS"])
+    df.to_csv(path, index=False)
+
+# ---------------- Main ----------------
+if __name__ == "__main__":
+    ensure_starter_dataset(DATA_FILE_DEFAULT)
+    app = SoilSmartApp()
+    app.mainloop()
